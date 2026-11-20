@@ -53,6 +53,37 @@ Fill in `firmwares/<id>.json`. `<id>` is lower case, digits and `-`, e.g.
 - `folder`: the folder on the SD card the firmware reads or writes, if any.
   Find it in the source (look for paths passed to `f_open`, `f_opendir`,
   `f_mkdir` and similar). Leave the field out if it uses none.
+- `files`: optional, for a firmware that comes with files for its `folder`
+  (presets, sample lists, settings). Look in the repository for a folder of
+  such files, e.g. `presets/`, and ask the author whether users should get
+  them when they install the firmware. If so:
+
+  ```json
+  "folder": "PHYMO",
+  "files": { "path": "presets", "match": "\\.txt$", "what": "presets" }
+  ```
+
+  - `path`: the folder in the repository. Everything in it goes into
+    `folder` on the card, keeping the subfolders: `presets/BANK1/P01.txt`
+    becomes `/PHYMO/BANK1/P01.txt`. The files are taken from the repository
+    at the release's tag, so they always fit the firmware being installed.
+  - `match`: optional regular expression on the path inside `path`. Only
+    matching files go on the card. Use it to keep a README or other notes off
+    the card.
+  - `what`: optional, what they are, for the page ("presets"), up to 24
+    characters.
+  - The firmware must also work **without** the files, and must find them
+    where they land. Check in the source that the paths it opens match the
+    folder layout on the card.
+  - A file that is already on the card is never replaced, so presets a user
+    saved over are safe. A file changed in a later release therefore only
+    reaches new installs. Tell the author this.
+  - Needs `folder` and `source.repo`. Names on the card: 1-32 of
+    `A-Z a-z 0-9 . _ -`, not starting with `.`, at most 4 levels and 96
+    characters in all. At most 200 files and 2 MB. `check` reports anything
+    that doesn't fit. A user needs launcher 1.8 for the files. The page
+    tells users with an older launcher to update it, and the firmware is
+    installed without its files until then.
 - `color`: optional, `#RRGGBB`, the colour of the firmware's key. Leave it
   out unless the author asks for one; the list's maintainer picks colours
   that are easy to tell apart on the LEDs.
