@@ -23,6 +23,7 @@ import re
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -39,7 +40,13 @@ KEEP = 4  # releases and pre-releases each that a pull request check tries
 CARD_RE = re.compile(r"^[A-Z0-9_-]{1,16}$")
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 REQUIRED = ("title", "card", "author", "summary", "source")
-KNOWN = set(REQUIRED) | {"folder", "color", "slot", "stock", "version", "maintainers", "skip", "prefer", "authorUrl", "about"}
+KNOWN = set(REQUIRED) | {"folder", "color", "slot", "stock", "version", "maintainers", "skip", "prefer", "authorUrl", "about", "files"}
+FILES_KNOWN = {"path", "what", "match"}
+# A firmware's own files for its folder (launcher 1.8, FILE): the launcher's
+# path rules (midi_upload.h PathValid), and limits so an install stays quick.
+PART_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]{0,31}$")
+MAX_PATH, MAX_PARTS = 96, 4
+MAX_FILES, MAX_FILE, MAX_FILES_TOTAL = 200, MAX_IMAGE, 2 * 1024 * 1024
 SOURCE_KNOWN = {"repo", "index", "tag", "asset", "zip"}
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?Z?)?$")
 
@@ -193,6 +200,25 @@ def entry_problems(eid, e, all_entries):
         bad.append("`color`: the key's colour as #RRGGBB, capital letters")
     if "folder" in e and not CARD_RE.match(e["folder"]):
         bad.append("`folder`: the folder name on the card, 1-16 of A-Z 0-9 _ -")
+    if "files" in e:
+        fs = e["files"]
+        if not isinstance(fs, dict) or not isinstance(fs.get("path"), str) or not fs["path"].strip("/"):
+            bad.append("`files`: an object with `path`, the folder in the repository whose files go into `folder` on the card")
+        else:
+            bad += [f"unknown field `files.{k}`" for k in fs if k not in FILES_KNOWN]
+            if "folder" not in e:
+                bad.append("`files` needs `folder`: the files go into that folder on the card, and nowhere else")
+            if "repo" not in e.get("source", {}):
+                bad.append("`files` needs `source.repo`: the files are taken from the repository at the release's tag")
+            if ".." in fs["path"].split("/"):
+                bad.append("`files.path`: no `..`")
+            if "match" in fs:
+                try:
+                    re.compile(fs["match"])
+                except (re.error, TypeError) as err:
+                    bad.append(f"`files.match` is not a valid regular expression: {err}")
+            if "what" in fs and not (isinstance(fs["what"], str) and 1 <= len(fs["what"]) <= 24):
+                bad.append("`files.what`: what they are, for the page, e.g. `presets` (24 characters at most)")
     if "slot" in e and not (e.get("stock") and isinstance(e["slot"], int) and 1 <= e["slot"] <= 15):
         bad.append("`slot` is only for stock firmwares (1-15)")
     if e.get("prefer", "stable") not in ("stable", "newest"):
@@ -263,6 +289,50 @@ def fetch_image(rec, member_re=None):
     CACHE.mkdir(exist_ok=True)
     (CACHE / f"{hashlib.sha256(data).hexdigest()}.bin").write_bytes(data)
     return data
+
+
+# ---- a firmware's own files -------------------------------------------------
+
+def release_files(e, tag):
+    """The files of `files.path` in the repository at `tag`, as
+    [(path on the card, bytes)], and the problems that keep them off the card.
+    Each file is taken from the git tree, so it is the one the tag points at;
+    cached by its git blob id."""
+    repo, base = e["source"]["repo"], e["files"]["path"].strip("/")
+    tree = json.loads(http(f"https://api.github.com/repos/{repo}/git/trees/{urllib.parse.quote(tag)}?recursive=1"))
+    if tree.get("truncated"):
+        return [], [f"the repository is too big to list at `{tag}`"]
+    only = e["files"].get("match")
+    blobs = [t for t in tree["tree"] if t["type"] == "blob" and t["path"].startswith(base + "/")
+             and (not only or re.search(only, t["path"][len(base) + 1:]))]
+    if not blobs:
+        return [], [f"no files in `{base}/` at `{tag}`"]
+    if len(blobs) > MAX_FILES:
+        return [], [f"{len(blobs)} files in `{base}/`, {MAX_FILES} at most"]
+    out, bad, total = [], [], 0
+    for t in sorted(blobs, key=lambda t: t["path"]):
+        card = e["folder"] + "/" + t["path"][len(base) + 1:]
+        parts = card.split("/")
+        if len(card) > MAX_PATH or len(parts) > MAX_PARTS or not all(PART_RE.match(x) for x in parts):
+            bad.append(f"`{t['path']}` can't go on the card as `{card}` (names of 1-32 of A-Z a-z 0-9 . _ -, "
+                       f"not starting with `.`, {MAX_PARTS} levels and {MAX_PATH} characters at most)")
+            continue
+        if t.get("size", 0) > MAX_FILE:
+            bad.append(f"`{t['path']}` is {t['size'] // 1024} KB, {MAX_FILE // 1024} KB at most")
+            continue
+        cached = CACHE / "blobs" / t["sha"]
+        if cached.exists():
+            data = cached.read_bytes()
+        else:
+            data = http(f"https://raw.githubusercontent.com/{repo}/{urllib.parse.quote(tag)}/{urllib.parse.quote(t['path'])}",
+                        accept="application/octet-stream")
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            cached.write_bytes(data)
+        total += len(data)
+        out.append((card, data))
+    if total > MAX_FILES_TOTAL:
+        bad.append(f"{total // 1024} KB of files, {MAX_FILES_TOTAL // 1024} KB at most")
+    return out, bad
 
 
 # ---- poll -------------------------------------------------------------------
@@ -471,6 +541,18 @@ def cmd_check(args):
             pre = ", pre-release" if r["prerelease"] else ""
             v = version_of(e, r, a["name"])
             out.append(f"  - {v} (`{r['tag_name']}`, `{a['name']}`{pre}): " + (f":x: {why}" if why else ":white_check_mark: CHOMPI firmware"))
+        if "files" in e:
+            r = found[0][0]
+            try:
+                got, bad = release_files(e, r["tag_name"])
+            except (urllib.error.URLError, ValueError, KeyError) as err:
+                got, bad = [], [f"can't list them: {err}"]
+            errors += len(bad)
+            out += [f"- :x: files: {b}" for b in bad]
+            if not bad:
+                kb = sum(len(d) for _, d in got) // 1024
+                out.append(f"- :white_check_mark: files at `{r['tag_name']}`: {len(got)} ({kb} KB) into `/{e['folder']}/` on the card, "
+                           f"e.g. `{got[0][0]}`. The page writes only those not on the card yet.")
         others = [o for oid, o in entries.items() if oid != eid and e.get("folder") and o.get("folder") == e["folder"]]
         if others:
             out.append(f"- note: shares the folder `{e['folder']}` with " + ", ".join(o["title"] for o in others))
@@ -550,6 +632,25 @@ def cmd_build(args):
         for k in ("folder", "slot", "color"):
             if k in e:
                 f[k] = e[k]
+        if "files" in e:
+            # Only with a clean set: one stray file and none go on the card.
+            try:
+                got, bad = release_files(e, cur["tag"])
+            except (urllib.error.URLError, ValueError, KeyError) as err:
+                got, bad = [], [f"can't list them: {err}"]
+            if bad:
+                problems += [f"{eid} {cur['version']} files: {b}" for b in bad]
+                problems.append(f"{eid}: its files left out")
+            else:
+                f["files"] = []
+                for card, data in got:
+                    frel = f"bin/{eid}/files-{safe(cur['version'])}/{card}"
+                    (out / frel).parent.mkdir(parents=True, exist_ok=True)
+                    (out / frel).write_bytes(data)
+                    f["files"].append({"path": card, "file": frel, "size": len(data),
+                                       "sha256": hashlib.sha256(data).hexdigest()})
+                if "what" in e["files"]:
+                    f["filesWhat"] = e["files"]["what"]
         prev = [{"version": r["version"], "size": r["size"], "sha256": r["sha256"]}
                 for r in known if r["published"] < cur["published"] and r["sha256"] != cur["sha256"]]
         if prev:
